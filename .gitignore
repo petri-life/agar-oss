@@ -1,0 +1,16 @@
+.secrets
+.claude/settings.local.json
+.DS_Store
+.gstack/
+__pycache__/
+*.pyc
+.venv/
+log/
+
+# Large data files
+data/
+
+# Runtime artifacts
+*.db
+.env
+sessions/

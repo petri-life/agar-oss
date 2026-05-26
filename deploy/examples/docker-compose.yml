@@ -1,0 +1,26 @@
+# Example Docker Compose for the Agar API.
+# Build context is the repo root (uses the root Dockerfile).
+#   OPENROUTER_API_KEY=sk-... docker compose -f deploy/examples/docker-compose.yml up --build
+
+services:
+  agar-api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      AGAR_MODEL: haiku
+      AGAR_OPENROUTER_MODEL: google/gemini-2.5-flash
+      AGAR_DEFAULT_CREDITS: "20"
+      AGAR_MAX_CONCURRENT: "1"
+      AGAR_ROUNDS: "5"
+      # Set this to use the OpenRouter backend:
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      # Lock down in production:
+      # AGAR_CORS_ORIGINS: "https://your-frontend.example"
+    volumes:
+      - agar_data:/app/data
+
+volumes:
+  agar_data:

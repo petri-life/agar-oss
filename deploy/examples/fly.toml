@@ -1,0 +1,47 @@
+# Example Fly.io config for the Agar API.
+# Copy to the repo root, set `app` to your own name, then `fly deploy`.
+# Secrets (set with `fly secrets set`): OPENROUTER_API_KEY
+
+app = 'your-agar-app'
+primary_region = 'ewr'
+
+[build]
+
+[env]
+  AGAR_MODEL = 'haiku'
+  AGAR_OPENROUTER_MODEL = 'google/gemini-2.5-flash'
+  AGAR_DEFAULT_CREDITS = '20'
+  AGAR_MAX_CONCURRENT = '1'
+  AGAR_ROUNDS = '5'
+  PORT = '8080'
+  # Lock this down to your frontend origin in production:
+  # AGAR_CORS_ORIGINS = 'https://your-frontend.example'
+
+[processes]
+  app = 'uv run uvicorn api.main:app --host 0.0.0.0 --port 8080'
+
+# SQLite lives on a persistent volume. Create it once:
+#   fly volumes create agar_data --size 1
+[[mounts]]
+  source = 'agar_data'
+  destination = '/app/data'
+  initial_size = '1gb'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'suspend'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    path = '/health'
+
+[[vm]]
+  memory = '1024mb'
+  cpu_kind = 'shared'
+  cpus = 1
