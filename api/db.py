@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent.parent / "data" / "agar_api.db"
+
+# When migrating legacy round-count balances to cents, each remaining round is
+# worth this many cents. Sized to the observed worst-case round cost so no
+# existing user loses runnable balance in the switch.
+LEGACY_ROUND_TO_CENTS = int(os.environ.get("AGAR_LEGACY_ROUND_CENTS", "10"))
 
 
 def _conn() -> sqlite3.Connection:
@@ -42,11 +48,16 @@ def init_db() -> None:
                 finished_at     TEXT,
                 error           TEXT,
                 comment_count   INTEGER NOT NULL DEFAULT 0,
-                sim_upvotes     INTEGER NOT NULL DEFAULT 0
+                sim_upvotes     INTEGER NOT NULL DEFAULT 0,
+                last_round_cost_cents INTEGER NOT NULL DEFAULT 0
             )
         """)
         # migrations for existing databases
-        for col in ("comment_count INTEGER NOT NULL DEFAULT 0", "sim_upvotes INTEGER NOT NULL DEFAULT 0"):
+        for col in (
+            "comment_count INTEGER NOT NULL DEFAULT 0",
+            "sim_upvotes INTEGER NOT NULL DEFAULT 0",
+            "last_round_cost_cents INTEGER NOT NULL DEFAULT 0",
+        ):
             try:
                 conn.execute(f"ALTER TABLE conversations ADD COLUMN {col}")
             except sqlite3.OperationalError:
@@ -73,13 +84,34 @@ def init_db() -> None:
             )
         """)
 
+        # ── credits_remaining: rounds → cents migration ──────────
+        # credits_remaining historically counted rounds (1/round). It now holds
+        # cents, billed from real per-round cost. A `credits_unit` marker makes
+        # the conversion run exactly once: keys still marked 'rounds' get their
+        # balance multiplied to cents and flipped to 'cents'. init_db runs on
+        # every startup, so this must be idempotent.
+        try:
+            conn.execute(
+                "ALTER TABLE api_keys ADD COLUMN credits_unit TEXT NOT NULL DEFAULT 'rounds'"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        conn.execute(
+            "UPDATE api_keys "
+            "SET credits_remaining = credits_remaining * ?, credits_unit = 'cents' "
+            "WHERE credits_unit = 'rounds'",
+            (LEGACY_ROUND_TO_CENTS,),
+        )
+
 
 # ── API keys ─────────────────────────────────────────────────
 
-def create_key(key: str, label: str, created_at: str, credits: int = 3) -> None:
+def create_key(key: str, label: str, created_at: str, credits: int = 0) -> None:
+    """Create a key. `credits` is a starting balance in cents (already-cents unit)."""
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO api_keys (key, label, created_at, credits_remaining) VALUES (?, ?, ?, ?)",
+            "INSERT INTO api_keys (key, label, created_at, credits_remaining, credits_unit) "
+            "VALUES (?, ?, ?, ?, 'cents')",
             (key, label, created_at, credits),
         )
 
@@ -107,30 +139,49 @@ def topup_key(key: str, credits: int) -> None:
         )
 
 
-def spend_credit(api_key: str) -> bool:
-    """Deduct 1 credit atomically. Returns False if none remaining."""
+def has_balance(api_key: str, min_cents: int) -> bool:
+    """True if the key is live and holds at least min_cents."""
     with _conn() as conn:
-        conn.execute("BEGIN EXCLUSIVE")
         row = conn.execute(
             "SELECT credits_remaining FROM api_keys WHERE key = ? AND revoked = 0",
             (api_key,),
         ).fetchone()
-        if not row or row["credits_remaining"] <= 0:
-            conn.execute("ROLLBACK")
-            return False
-        conn.execute(
-            "UPDATE api_keys SET credits_remaining = credits_remaining - 1 WHERE key = ?",
-            (api_key,),
-        )
-        return True
+        return bool(row) and row["credits_remaining"] >= min_cents
 
 
-def refund_credit(api_key: str) -> None:
+def decrement_cents(api_key: str, cents: int) -> int:
+    """Deduct `cents` from the balance atomically, clamping at zero.
+
+    Returns the new balance. Cost is reconciled *after* a round runs, so the
+    actual spend can exceed the pre-round estimate; clamping at zero means a
+    user is never billed into negative, but also never blocked mid-round.
+    """
+    cents = max(0, int(cents))
     with _conn() as conn:
-        conn.execute(
-            "UPDATE api_keys SET credits_remaining = credits_remaining + 1 WHERE key = ?",
+        conn.execute("BEGIN EXCLUSIVE")
+        row = conn.execute(
+            "SELECT credits_remaining FROM api_keys WHERE key = ?",
             (api_key,),
+        ).fetchone()
+        if not row:
+            conn.execute("ROLLBACK")
+            return 0
+        new_balance = max(0, row["credits_remaining"] - cents)
+        conn.execute(
+            "UPDATE api_keys SET credits_remaining = ? WHERE key = ?",
+            (new_balance, api_key),
         )
+        return new_balance
+
+
+def get_balance(api_key: str) -> int:
+    """Current balance in cents, or 0 if the key is missing/revoked."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT credits_remaining FROM api_keys WHERE key = ? AND revoked = 0",
+            (api_key,),
+        ).fetchone()
+        return row["credits_remaining"] if row else 0
 
 
 # ── Conversations ────────────────────────────────────────────
@@ -143,22 +194,24 @@ def create_conversation_if_quota(
     agent_count: int,
     persona_mix: float,
     created_at: str,
+    min_cents: int = 0,
 ) -> bool:
-    """Decrement credits and insert conversation atomically.
-    Returns True if inserted, False if no credits remaining."""
+    """Gate on balance, then insert the conversation atomically.
+
+    Estimate-then-reconcile: this only *gates* on `min_cents` (the worst-case
+    round estimate). The actual cost is deducted by the runner after the round
+    runs, from real per-call usage.cost. `min_cents=0` means unmetered (e.g. the
+    Claude-CLI backend, which returns no cost data) — gate always passes.
+    """
     with _conn() as conn:
         conn.execute("BEGIN EXCLUSIVE")
         row = conn.execute(
             "SELECT credits_remaining FROM api_keys WHERE key = ? AND revoked = 0",
             (api_key,),
         ).fetchone()
-        if not row or row["credits_remaining"] <= 0:
+        if not row or row["credits_remaining"] < min_cents:
             conn.execute("ROLLBACK")
             return False
-        conn.execute(
-            "UPDATE api_keys SET credits_remaining = credits_remaining - 1 WHERE key = ?",
-            (api_key,),
-        )
         conn.execute(
             """INSERT INTO conversations
                (conversation_id, session_id, api_key, topic, status, agent_count, persona_mix, created_at)

@@ -2,11 +2,13 @@
 """
 Agar API key management
 
+Balances are in cents.
+
 Usage:
-  uv run agar-keys create-key <label> [credits=3]
+  uv run agar-keys create-key <label> [cents=0]
   uv run agar-keys list-keys
   uv run agar-keys revoke-key <key>
-  uv run agar-keys topup <key> <credits>
+  uv run agar-keys topup <key> <cents>
 """
 
 from __future__ import annotations
@@ -21,14 +23,14 @@ from api.db import (
 )
 
 
-def cmd_create(label: str, credits: str = "3") -> None:
+def cmd_create(label: str, cents: str = "0") -> None:
     init_db()
     key = "agar-" + secrets.token_urlsafe(24)
     now = datetime.now(timezone.utc).isoformat()
-    create_key(key, label, now, int(credits))
-    print(f"key:     {key}")
-    print(f"label:   {label}")
-    print(f"credits: {credits}")
+    create_key(key, label, now, int(cents))
+    print(f"key:   {key}")
+    print(f"label: {label}")
+    print(f"cents: {cents}")
 
 
 def cmd_list() -> None:
@@ -37,7 +39,7 @@ def cmd_list() -> None:
     if not rows:
         print("No keys.")
         return
-    print(f"{'label':<20} {'credits':>7}  {'status':<8}  key")
+    print(f"{'label':<20} {'cents':>7}  {'status':<8}  key")
     print("-" * 72)
     for r in rows:
         status = "revoked" if r["revoked"] else "active"
@@ -73,19 +75,19 @@ def _resolve_key(key_or_label: str) -> str:
     sys.exit(1)
 
 
-def cmd_topup(key_or_label: str, credits: str) -> None:
+def cmd_topup(key_or_label: str, cents: str) -> None:
     init_db()
     key = _resolve_key(key_or_label)
-    topup_key(key, int(credits))
+    topup_key(key, int(cents))
     updated = get_key(key)
-    print(f"Topped up: +{credits} → {updated['credits_remaining']} remaining ({updated['label']})")
+    print(f"Topped up: +{cents}¢ → {updated['credits_remaining']}¢ remaining ({updated['label']})")
 
 
 COMMANDS = {
-    "create-key": (cmd_create, (1, 2), "create-key <label> [credits=3]"),
+    "create-key": (cmd_create, (1, 2), "create-key <label> [cents=0]"),
     "list-keys":  (cmd_list,   (0, 0), "list-keys"),
     "revoke-key": (cmd_revoke, (1, 1), "revoke-key <key|label>"),
-    "topup":      (cmd_topup,  (2, 2), "topup <key|label> <credits>"),
+    "topup":      (cmd_topup,  (2, 2), "topup <key|label> <cents>"),
 }
 
 def main():

@@ -37,14 +37,25 @@ from api.db import (
     create_conversation_if_quota, update_conversation,
     get_conversation, list_conversations,
     append_progress, get_progress,
-    upvote_comment, spend_credit, refund_credit,
+    upvote_comment, get_balance, has_balance, topup_key,
 )
 from api.sampler import assemble_population
 from api.thread import load_thread, add_comment
 
 # ── config ────────────────────────────────────────────────────
 
-DEFAULT_CREDITS = int(os.environ.get("AGAR_DEFAULT_CREDITS", "20"))
+# Balances are in cents. A new token's starting balance (default 0 — hosted
+# tops up via Stripe; local dev can set a free allowance).
+DEFAULT_CREDIT_CENTS = int(os.environ.get("AGAR_DEFAULT_CREDIT_CENTS", "0"))
+# Worst-case per-round cost used only to GATE a round start. Actual cost is
+# reconciled after the round from real usage.cost. 0 = unmetered gate.
+ROUND_ESTIMATE_CENTS = int(os.environ.get("AGAR_ROUND_ESTIMATE_CENTS", "10"))
+# Whether this deployment meters cost at all (only the OpenRouter backend
+# returns cost data; the Claude-CLI free tier does not).
+METERED = bool(os.environ.get("OPENROUTER_API_KEY", ""))
+# Shared secret guarding token minting and credit top-ups. When set, callers
+# must send X-Mint-Secret. Unset (OSS default) = open, free local use.
+MINT_SECRET = os.environ.get("AGAR_MINT_SECRET", "")
 MAX_CONCURRENT = int(os.environ.get("AGAR_MAX_CONCURRENT", "1"))
 TOPIC_MIN_CHARS = 200
 TOPIC_MAX_CHARS = 10000
@@ -114,6 +125,21 @@ def require_api_key(request: Request) -> str:
     return key
 
 
+def require_mint_secret(request: Request) -> None:
+    """Gate privileged minting/top-up endpoints.
+
+    When AGAR_MINT_SECRET is set (hosted), callers must send a matching
+    X-Mint-Secret header. When unset (OSS default), the gate is open so local
+    deployments mint freely. Uses a constant-time compare to avoid leaking the
+    secret via timing.
+    """
+    if not MINT_SECRET:
+        return
+    provided = request.headers.get("X-Mint-Secret", "")
+    if not secrets.compare_digest(provided, MINT_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Mint-Secret")
+
+
 # ── request models ────────────────────────────────────────────
 
 class CreateConversation(BaseModel):
@@ -162,11 +188,39 @@ def _generate_label() -> str:
 # ── endpoints ─────────────────────────────────────────────────
 
 @app.post("/tokens", status_code=201)
-async def mint_token() -> dict:
+async def mint_token(request: Request) -> dict:
+    require_mint_secret(request)
     key = "agar-" + secrets.token_urlsafe(24)
     label = _generate_label()
-    create_key(key, label, _now(), DEFAULT_CREDITS)
-    return {"token": key, "label": label, "credits": DEFAULT_CREDITS}
+    create_key(key, label, _now(), DEFAULT_CREDIT_CENTS)
+    return {"token": key, "label": label, "credit_cents": DEFAULT_CREDIT_CENTS}
+
+
+class AddCredits(BaseModel):
+    token: str
+    cents: int
+
+    @field_validator("cents")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("cents must be positive")
+        return v
+
+
+@app.post("/credits/add")
+async def add_credits_endpoint(body: AddCredits, request: Request) -> dict:
+    """Top up a token's balance (cents). Gated by X-Mint-Secret.
+
+    Called by the hosted payment webhook after a successful charge. The webhook
+    — not the browser — holds the mint secret, so users can't self-credit.
+    """
+    require_mint_secret(request)
+    row = get_key(body.token)
+    if row is None or row["revoked"]:
+        raise HTTPException(status_code=404, detail="Token not found")
+    topup_key(body.token, body.cents)
+    return {"token": body.token, "balance_cents": get_balance(body.token)}
 
 
 @app.post("/conversations", status_code=202)
@@ -190,9 +244,14 @@ async def create_conversation_endpoint(
         agent_count=len(profiles),
         persona_mix=body.persona_mix,
         created_at=_now(),
+        min_cents=ROUND_ESTIMATE_CENTS if METERED else 0,
     )
     if not inserted:
-        raise HTTPException(status_code=429, detail="Credit limit reached.")
+        raise HTTPException(
+            status_code=402,
+            detail=f"Insufficient balance. Round needs ~{ROUND_ESTIMATE_CENTS}¢; "
+                   f"you have {get_balance(api_key)}¢.",
+        )
 
     runner.start(conversation_id, api_key, body.topic, profiles)
 
@@ -200,6 +259,7 @@ async def create_conversation_endpoint(
         "conversation_id": conversation_id,
         "status": "queued",
         "poll": f"/conversations/{conversation_id}",
+        "balance_cents": get_balance(api_key),
     }
 
 
@@ -241,6 +301,7 @@ async def get_conversation_endpoint(conversation_id: str, after: int = 0) -> dic
         "error": row["error"],
         "comment_count": row["comment_count"],
         "sim_upvotes": row["sim_upvotes"],
+        "last_round_cost_cents": row["last_round_cost_cents"],
         "progress": get_progress(conversation_id, after=after),
     }
 
@@ -298,7 +359,11 @@ async def upvote_endpoint(
 
 @app.post("/conversations/{conversation_id}/next")
 async def next_round_endpoint(conversation_id: str, request: Request) -> dict:
-    """Run the next round. Costs 1 credit. Conversation must be paused."""
+    """Run the next round. Conversation must be paused.
+
+    Gates on balance (estimate); the actual cost is reconciled by the runner
+    after the round completes, from real per-call usage.cost.
+    """
     api_key = require_api_key(request)
     if runner.is_busy(conversation_id):
         raise HTTPException(status_code=409, detail="Round already in progress")
@@ -307,12 +372,19 @@ async def next_round_endpoint(conversation_id: str, request: Request) -> dict:
         raise HTTPException(status_code=404, detail="Conversation not found")
     if row["round_count"] >= runner.MAX_ROUNDS:
         raise HTTPException(status_code=409, detail=f"Max {runner.MAX_ROUNDS} rounds reached")
-    if not spend_credit(api_key):
-        raise HTTPException(status_code=429, detail="No credits remaining")
+    if METERED and not has_balance(api_key, ROUND_ESTIMATE_CENTS):
+        raise HTTPException(
+            status_code=402,
+            detail=f"Insufficient balance. Round needs ~{ROUND_ESTIMATE_CENTS}¢; "
+                   f"you have {get_balance(api_key)}¢.",
+        )
     if not runner.next_round(conversation_id, api_key):
-        refund_credit(api_key)
         raise HTTPException(status_code=409, detail="Conversation not paused")
-    return {"conversation_id": conversation_id, "status": "running"}
+    return {
+        "conversation_id": conversation_id,
+        "status": "running",
+        "balance_cents": get_balance(api_key),
+    }
 
 
 @app.post("/conversations/{conversation_id}/finish")
@@ -334,7 +406,8 @@ async def kill_endpoint(conversation_id: str, request: Request) -> dict:
     if runner.cancel(conversation_id):
         update_conversation(conversation_id, status="failed", error="Cancelled", finished_at=_now())
         append_progress(conversation_id, "Cancelled by user", _now(), "error")
-        refund_credit(api_key)
+        # No refund: cost is reconciled per-round from real usage, never charged
+        # upfront. A cancelled in-flight round bills its partial spend in the runner.
         return {"conversation_id": conversation_id, "status": "cancelled"}
 
     return {"conversation_id": conversation_id, "status": row["status"], "detail": "Not running"}
