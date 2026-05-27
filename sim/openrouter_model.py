@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Type
@@ -50,6 +51,8 @@ def _attribution_headers() -> dict[str, str]:
     if HTTP_REFERER:
         headers["HTTP-Referer"] = HTTP_REFERER
     return headers
+
+
 DEFAULT_MODEL = os.environ.get("AGAR_OPENROUTER_MODEL", "google/gemini-2.5-flash")
 
 
@@ -65,12 +68,42 @@ class OpenRouterModel(BaseModelBackend):
         self._or_model = model or DEFAULT_MODEL
         self._or_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self._timeout = timeout
+        # Running USD cost across calls, summed from each response's usage.cost.
+        # Agents call concurrently within a round, so guard with a lock.
+        self._cost_lock = threading.Lock()
+        self._cost_accumulated = 0.0
         super().__init__(
             model_type="openrouter",
             model_config_dict={},
             api_key=self._or_key,
             timeout=timeout,
         )
+
+    @property
+    def cost_accumulated(self) -> float:
+        """Total USD cost summed across calls since the last reset."""
+        with self._cost_lock:
+            return self._cost_accumulated
+
+    def reset_cost(self) -> float:
+        """Return the accumulated USD cost and zero the counter atomically."""
+        with self._cost_lock:
+            spent = self._cost_accumulated
+            self._cost_accumulated = 0.0
+            return spent
+
+    def _record_cost(self, data: dict) -> None:
+        """Add this response's usage.cost (USD) to the accumulator.
+
+        OpenRouter includes usage.cost in every response automatically.
+        A missing/null cost (e.g. an error payload) contributes 0 rather
+        than crashing the call path — billing must never break inference.
+        """
+        cost = (data.get("usage") or {}).get("cost")
+        if cost is None:
+            return
+        with self._cost_lock:
+            self._cost_accumulated += float(cost)
 
     def _messages_to_prompt(
         self,
@@ -131,6 +164,7 @@ class OpenRouterModel(BaseModelBackend):
             )
             resp.raise_for_status()
             data = resp.json()
+            self._record_cost(data)
             return data["choices"][0]["message"]["content"]
 
     async def _acall_api(self, messages: list[dict]) -> str:
@@ -145,6 +179,7 @@ class OpenRouterModel(BaseModelBackend):
             )
             resp.raise_for_status()
             data = resp.json()
+            self._record_cost(data)
             return data["choices"][0]["message"]["content"]
 
     def _make_response(

@@ -14,7 +14,7 @@ import threading
 from datetime import datetime, timezone
 
 from api.db import (
-    update_conversation, append_progress, refund_credit,
+    update_conversation, append_progress, decrement_cents,
 )
 
 DEFAULT_MODEL = os.environ.get("AGAR_MODEL", "haiku")
@@ -22,6 +22,12 @@ DEFAULT_TIMEOUT = float(os.environ.get("AGAR_TIMEOUT", "60"))
 DEFAULT_ACTIVATION = float(os.environ.get("AGAR_ACTIVATION", "0"))
 MAX_ROUNDS = int(os.environ.get("AGAR_MAX_ROUNDS", "10"))
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+
+
+def _usd_to_cents(usd: float) -> int:
+    """Round USD up to whole cents — never under-bill a fractional cent."""
+    import math
+    return max(0, math.ceil(usd * 100))
 
 log = logging.getLogger("agar.runner")
 
@@ -95,9 +101,32 @@ def _run_round_sync(
             append_progress(conversation_id, f"Round {round_num}: {highlight}", _now(), "round")
             log.info("Conversation %s: round %d — %s", conversation_id, round_num, highlight)
 
+        # Reset cost accumulator so we measure only this round's spend.
+        backend = getattr(session, "_model_backend", None)
+        meters_cost = backend is not None and hasattr(backend, "reset_cost")
+        if meters_cost:
+            backend.reset_cost()
+
         loop.run_until_complete(
             session.run(rounds=1, on_round=on_round)
         )
+
+        # Reconcile: bill the real cost this round actually incurred. Deducting
+        # after the round means a round that started always settles its bill —
+        # we never strand a half-charged round. The Claude-CLI backend has no
+        # cost data (meters_cost False), so it runs unmetered (free local tier).
+        if meters_cost:
+            spent_usd = backend.reset_cost()
+            spent_cents = _usd_to_cents(spent_usd)
+            new_balance = decrement_cents(api_key, spent_cents)
+            update_conversation(conversation_id, last_round_cost_cents=spent_cents)
+            append_progress(
+                conversation_id,
+                f"Round cost: {spent_cents}¢ — balance {new_balance}¢",
+                _now(), "cost",
+            )
+            log.info("Conversation %s: billed %d¢ (USD %.4f), balance %d¢",
+                     conversation_id, spent_cents, spent_usd, new_balance)
 
         _snapshot_stats(conversation_id, session.session_id)
         update_conversation(conversation_id, status="paused")
@@ -107,7 +136,16 @@ def _run_round_sync(
         log.exception("Conversation %s failed", conversation_id)
         update_conversation(conversation_id, status="failed", error=str(e), finished_at=_now())
         append_progress(conversation_id, f"Failed: {e}", _now(), "error")
-        refund_credit(api_key)  # refund the round credit on failure
+        # Estimate-then-reconcile: a failed round still bills whatever real cost
+        # it incurred before failing (calls already cost money). Capture the
+        # partial spend rather than refunding it or charging a flat round.
+        backend = getattr(session, "_model_backend", None)
+        if backend is not None and hasattr(backend, "reset_cost"):
+            spent_cents = _usd_to_cents(backend.reset_cost())
+            if spent_cents:
+                decrement_cents(api_key, spent_cents)
+                log.info("Conversation %s: billed %d¢ for partial failed round",
+                         conversation_id, spent_cents)
     finally:
         if session:
             try:
