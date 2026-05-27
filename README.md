@@ -82,10 +82,12 @@ Full CLI:
 uv run agar-api          # serves on :8080
 ```
 
-Endpoints (all under `X-API-Key`):
+Endpoints. Conversation endpoints use `X-API-Key`; `/tokens` and `/credits/add`
+are gated by `X-Mint-Secret` (open by default — see [Configuration](#configuration)):
 
 ```
-POST   /tokens                          mint an anonymous token
+POST   /tokens                          mint an anonymous token       [X-Mint-Secret]
+POST   /credits/add                     top up a token's balance (¢)  [X-Mint-Secret]
 POST   /conversations                   start a conversation (runs round 1)
 GET    /conversations                   list
 GET    /conversations/{id}              poll status + progress
@@ -97,6 +99,10 @@ POST   /conversations/{id}/finish       mark done
 DELETE /conversations/{id}              delete
 GET    /health
 ```
+
+Balances are in cents. Responses to `/tokens`, `/conversations`, and
+`/conversations/{id}/next` carry `balance_cents`; conversation status carries
+`last_round_cost_cents`. See [Cost & credits](#cost--credits).
 
 ---
 
@@ -157,15 +163,47 @@ All via environment variables:
 
 | Var | Default | Purpose |
 |---|---|---|
-| `AGAR_MODEL` | `haiku` | Model backend tier |
-| `OPENROUTER_API_KEY` | — | Enables the OpenRouter backend when set |
+| `AGAR_MODEL` | `haiku` | Model backend tier (Claude CLI) |
+| `OPENROUTER_API_KEY` | — | Enables the OpenRouter backend **and** cost metering when set |
 | `AGAR_OPENROUTER_MODEL` | `google/gemini-2.5-flash` | OpenRouter model |
-| `AGAR_DEFAULT_CREDITS` | `20` | Credits granted to a new token |
 | `AGAR_MAX_CONCURRENT` | `1` | Max simultaneous simulations |
-| `AGAR_ROUNDS` / `AGAR_MAX_ROUNDS` | `5` / `10` | Default / max rounds |
+| `AGAR_MAX_ROUNDS` | `10` | Hard cap on rounds per conversation |
+| `AGAR_TIMEOUT` | `60` | Per-LLM-call timeout (seconds) |
 | `AGAR_CORS_ORIGINS` | `*` | Comma-separated allowed origins (lock down in production) |
 | `AGAR_HTTP_REFERER` / `AGAR_APP_TITLE` | — / `Agar` | OpenRouter attribution headers |
 | `AGAR_SARC_PATH` etc. | `personas/personas_*.jsonl` | Override persona file locations |
+
+**Credits & metering** (only relevant when `OPENROUTER_API_KEY` is set):
+
+| Var | Default | Purpose |
+|---|---|---|
+| `AGAR_DEFAULT_CREDIT_CENTS` | `0` | Starting balance (cents) for a newly minted token |
+| `AGAR_ROUND_ESTIMATE_CENTS` | `10` | Worst-case cost used to *gate* a round start; real cost charged after |
+| `AGAR_MINT_SECRET` | — | When set, `/tokens` and `/credits/add` require a matching `X-Mint-Secret` header. Unset = open (OSS default) |
+| `AGAR_LEGACY_ROUND_CENTS` | `10` | Cents per round when migrating pre-cents (round-count) balances |
+
+---
+
+## Cost & credits
+
+The Claude-CLI backend (the default) is **unmetered** — it returns no cost data,
+so local runs are free. Metering turns on only when `OPENROUTER_API_KEY` is set.
+
+When metered, balances are tracked in **cents** and billed per round using
+**estimate-then-reconcile**:
+
+1. A round only starts if the balance covers `AGAR_ROUND_ESTIMATE_CENTS` (a
+   worst-case gate, default 10¢).
+2. The OpenRouter backend accumulates the real `usage.cost` from every LLM call
+   in the round (thread-safe across concurrent agents).
+3. After the round, the runner sums that cost, converts USD → cents (rounded
+   **up**), and deducts it. A started round always settles — cost is never
+   charged upfront, so there are no refunds. A failed or cancelled round still
+   bills whatever it spent before stopping.
+
+A new token starts at `AGAR_DEFAULT_CREDIT_CENTS` (0 by default). Top it up out
+of band with `POST /credits/add` — gated by `X-Mint-Secret` so only a trusted
+caller (e.g. a payment webhook), not the browser, can add credit.
 
 ---
 
