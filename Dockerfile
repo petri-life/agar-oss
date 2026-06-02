@@ -14,7 +14,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock ./
 COPY sim/ sim/
 COPY api/ api/
-COPY cli.py VERSION ./
+COPY cli.py VERSION README.md LICENSE NOTICE ./
 COPY personas/ personas/
 
 # Install dependencies
