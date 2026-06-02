@@ -35,11 +35,16 @@ from api import runner
 from api.db import (
     init_db, create_key, get_key,
     create_conversation_if_quota, update_conversation,
-    get_conversation, list_conversations,
+    get_conversation, list_conversations, list_user_conversations,
     append_progress, get_progress,
     upvote_comment, get_balance, has_balance, topup_key,
+    get_round_costs,
 )
+from api.models import get_tier
 from api.sampler import assemble_population
+from api.security import (
+    InputRejected, check_topic_pattern, moderate_topic_with_llm,
+)
 from api.thread import load_thread, add_comment
 
 # ── config ────────────────────────────────────────────────────
@@ -145,6 +150,9 @@ def require_mint_secret(request: Request) -> None:
 class CreateConversation(BaseModel):
     topic: str
     persona_mix: float = 0.5
+    # Tier name: "flash" (default), "pro", or "sonnet". Unknown values fall
+    # back to the configured default in get_tier(). Locked at sim creation.
+    model: str | None = None
 
     @field_validator("topic")
     @classmethod
@@ -223,6 +231,37 @@ async def add_credits_endpoint(body: AddCredits, request: Request) -> dict:
     return {"token": body.token, "balance_cents": get_balance(body.token)}
 
 
+@app.get("/tiers")
+async def list_tiers_endpoint() -> dict:
+    """Public list of model tiers + their per-round estimate.
+
+    The FE reads this to build the Composer model picker. Estimate is the
+    server-side balance gate, so it doubles as a UX hint ('Sonnet round
+    needs ~170¢').
+    """
+    from api.models import TIERS, DEFAULT_TIER
+    return {
+        "default": DEFAULT_TIER,
+        "tiers": [
+            {"name": t.name, "model": t.model, "estimate_cents": t.estimate_cents}
+            for t in TIERS.values()
+        ],
+    }
+
+
+@app.get("/balance")
+async def get_balance_endpoint(request: Request) -> dict:
+    """Read the current balance for the calling token.
+
+    Authenticated by X-API-Key (token holder reads their own balance — not a
+    privileged op). Frontends need this on page load: balance is otherwise
+    only echoed by mutations, so without a probe the UI cannot show credits
+    until the user spends some.
+    """
+    api_key = require_api_key(request)
+    return {"balance_cents": get_balance(api_key)}
+
+
 @app.post("/conversations", status_code=202)
 async def create_conversation_endpoint(
     body: CreateConversation,
@@ -232,6 +271,37 @@ async def create_conversation_endpoint(
 
     if runner.is_at_capacity(MAX_CONCURRENT):
         raise HTTPException(status_code=429, detail=f"Max {MAX_CONCURRENT} concurrent simulation(s). Try again later.")
+
+    # ── L1 + L2: prompt-injection defenses ─────────────────────
+    # See api/security.py. Layered. Both run BEFORE we spend any sim cost.
+    try:
+        check_topic_pattern(body.topic)
+    except InputRejected as e:
+        log.info("Rejected topic (pattern=%s) from %s", e.pattern_label, api_key[:12])
+        raise HTTPException(
+            status_code=400,
+            detail=f"Topic rejected: matches a known prompt-injection pattern ({e.pattern_label}). "
+                   "Rephrase as a normal product idea or discussion topic.",
+        )
+    mod = moderate_topic_with_llm(body.topic)
+    if mod.flagged:
+        log.info("Rejected topic (moderation=%s) from %s", mod.reason, api_key[:12])
+        raise HTTPException(
+            status_code=400,
+            detail="Topic rejected by content review. Submit a normal product idea "
+                   "or discussion topic.",
+        )
+    elif mod.reason.startswith("moderation_error"):
+        # Fail-open path: record that we let this through despite the moderator
+        # being unavailable. Surfaces ops issues; doesn't block submissions.
+        log.warning("Moderation bypassed for %s: %s", api_key[:12], mod.reason)
+
+    # Resolve the tier from the request, locking it for the lifetime of this
+    # sim. The estimate is per-tier so Sonnet rounds get gated at ~$1 while
+    # Flash rounds gate at ~10¢ — without this, a Sonnet round could start
+    # with a 10¢ balance and burn $1 of real OpenRouter credit on us.
+    tier = get_tier(body.model)
+    estimate = tier.estimate_cents
 
     conversation_id = str(uuid.uuid4())[:8]
     profiles = assemble_population(body.persona_mix, seed=random.randint(0, 99999))
@@ -244,12 +314,13 @@ async def create_conversation_endpoint(
         agent_count=len(profiles),
         persona_mix=body.persona_mix,
         created_at=_now(),
-        min_cents=ROUND_ESTIMATE_CENTS if METERED else 0,
+        min_cents=estimate if METERED else 0,
+        model_id=tier.name,
     )
     if not inserted:
         raise HTTPException(
             status_code=402,
-            detail=f"Insufficient balance. Round needs ~{ROUND_ESTIMATE_CENTS}¢; "
+            detail=f"Insufficient balance. {tier.name} round needs ~{estimate}¢; "
                    f"you have {get_balance(api_key)}¢.",
         )
 
@@ -276,34 +347,86 @@ async def list_conversations_endpoint() -> list[dict]:
             "comment_count": r["comment_count"],
             "sim_upvotes": r["sim_upvotes"],
             "score": r["score"],
+            "model_id": r["model_id"],
             "created_at": r["created_at"],
         }
         for r in rows
     ]
 
 
+@app.get("/me/conversations")
+async def list_my_conversations_endpoint(request: Request) -> list[dict]:
+    """The caller's own conversations with cost history. Authenticated.
+
+    Distinct from public GET /conversations which omits cost columns entirely.
+    Each entry includes a `rounds` array with one entry per recorded round
+    (round_num, cost_cents, recorded_at). round_num=0 is a partial-failure
+    bucket; positive ints are real completed rounds.
+    """
+    api_key = require_api_key(request)
+    rows = list_user_conversations(api_key)
+    out: list[dict] = []
+    for r in rows:
+        cid = r["conversation_id"]
+        rounds = [
+            {
+                "round_num": rc["round_num"],
+                "cost_cents": rc["cost_cents"],
+                "recorded_at": rc["recorded_at"],
+            }
+            for rc in get_round_costs(cid)
+        ]
+        out.append({
+            "conversation_id": cid,
+            "topic": r["topic"][:120] + "..." if len(r["topic"]) > 120 else r["topic"],
+            "status": r["status"],
+            "agent_count": r["agent_count"],
+            "round_count": r["round_count"],
+            "comment_count": r["comment_count"],
+            "sim_upvotes": r["sim_upvotes"],
+            "score": r["score"],
+            "created_at": r["created_at"],
+            "finished_at": r["finished_at"],
+            "total_cost_cents": r["total_cost_cents"],
+            "last_round_cost_cents": r["last_round_cost_cents"],
+            "model_id": r["model_id"],
+            "rounds": rounds,
+        })
+    return out
+
+
 @app.get("/conversations/{conversation_id}")
-async def get_conversation_endpoint(conversation_id: str, after: int = 0) -> dict:
+async def get_conversation_endpoint(conversation_id: str, request: Request, after: int = 0) -> dict:
     row = get_conversation(conversation_id)
     if not row:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    return {
+    # Cost is owner-private. Include last_round_cost_cents only when the caller
+    # holds the owning api_key; otherwise omit so the public detail page can't
+    # be used to infer per-user spend. Same key the runner billed against.
+    caller_key = request.headers.get("X-API-Key", "").strip()
+    is_owner = bool(caller_key) and caller_key == row["api_key"]
+
+    body = {
         "conversation_id": row["conversation_id"],
         "topic": row["topic"],
         "status": row["status"],
         "agent_count": row["agent_count"],
         "round_count": row["round_count"],
         "persona_mix": row["persona_mix"],
+        "model_id": row["model_id"],
         "created_at": row["created_at"],
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
         "error": row["error"],
         "comment_count": row["comment_count"],
         "sim_upvotes": row["sim_upvotes"],
-        "last_round_cost_cents": row["last_round_cost_cents"],
         "progress": get_progress(conversation_id, after=after),
     }
+    if is_owner:
+        body["last_round_cost_cents"] = row["last_round_cost_cents"]
+        body["total_cost_cents"] = row["total_cost_cents"]
+    return body
 
 
 @app.get("/conversations/{conversation_id}/thread")
@@ -372,10 +495,13 @@ async def next_round_endpoint(conversation_id: str, request: Request) -> dict:
         raise HTTPException(status_code=404, detail="Conversation not found")
     if row["round_count"] >= runner.MAX_ROUNDS:
         raise HTTPException(status_code=409, detail=f"Max {runner.MAX_ROUNDS} rounds reached")
-    if METERED and not has_balance(api_key, ROUND_ESTIMATE_CENTS):
+    # Gate using the tier this sim was created on — sonnet rounds need a
+    # bigger balance than flash. The tier is locked per sim (row["model_id"]).
+    tier = get_tier(row["model_id"])
+    if METERED and not has_balance(api_key, tier.estimate_cents):
         raise HTTPException(
             status_code=402,
-            detail=f"Insufficient balance. Round needs ~{ROUND_ESTIMATE_CENTS}¢; "
+            detail=f"Insufficient balance. {tier.name} round needs ~{tier.estimate_cents}¢; "
                    f"you have {get_balance(api_key)}¢.",
         )
     if not runner.next_round(conversation_id, api_key):
