@@ -186,12 +186,20 @@ SANITIZED_REPLIES: list[str] = [
 ]
 
 
-def sanitize_llm_output(content: str) -> tuple[str, bool]:
+def sanitize_llm_output(content: str | None) -> tuple[str | None, bool]:
     """If `content` contains persona-leak fingerprints, replace it with a
     generic in-character refusal selected by content-hash.
 
     Returns (sanitized_content, was_sanitized).
+
+    None / non-string inputs pass through unchanged. Pro / Sonnet sometimes
+    return content=None when the model declines to answer (Flash always
+    returns a string); previously this raised TypeError from re.search and
+    hung the runner mid-round. Letting None through means the upstream caller
+    sees the same empty response it would have seen without this hook.
     """
+    if not isinstance(content, str):
+        return content, False
     for pat in PERSONA_LEAK_PATTERNS:
         if pat.search(content):
             idx = int(hashlib.sha1(content.encode("utf-8")).hexdigest(), 16) % len(SANITIZED_REPLIES)

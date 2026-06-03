@@ -227,3 +227,20 @@ def test_mint_open_when_secret_unset(tmp_path, monkeypatch):
     r = c.post("/tokens")  # no secret header
     assert r.status_code == 201
     assert "token" in r.json()
+
+
+# ─── L3 output sanitizer: None content ──────────────────────
+def test_sanitize_none_content_passes_through():
+    """Pro/Sonnet sometimes return content=None when the model declines.
+    Without this guard the sanitizer raised TypeError mid-round and the
+    runner hung waiting on the failed agent coroutine."""
+    from api.security import sanitize_llm_output
+    result, was = sanitize_llm_output(None)
+    assert result is None
+    assert was is False
+
+def test_sanitize_non_string_content_passes_through():
+    from api.security import sanitize_llm_output
+    result, was = sanitize_llm_output(42)
+    assert result == 42
+    assert was is False
