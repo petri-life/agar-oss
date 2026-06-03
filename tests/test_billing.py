@@ -244,3 +244,10 @@ def test_sanitize_non_string_content_passes_through():
     result, was = sanitize_llm_output(42)
     assert result == 42
     assert was is False
+
+
+# ─── tier resolution ─────────────────────────────────────────
+def test_get_tier_unknown_falls_back_to_default():
+    from api.models import get_tier, DEFAULT_TIER
+    t = get_tier("does-not-exist")
+    assert t.name == DEFAULT_TIER

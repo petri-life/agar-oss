@@ -27,19 +27,18 @@ _DEFAULTS: dict[str, tuple[str, int]] = {
     # cost so balances never go negative. Round up; refund is automatic
     # since cost is reconciled from real usage.cost after the round.
     #
-    # Calibration runs (2026-06-03):
-    #   flash   real 4-16c/round across 5+ sims (small topics — large topics
-    #           push higher; the variance with persona_mix and round number
-    #           is real). 20c gate gives 25% headroom.
-    #   pro     real 67c on a 32-comment round. Surprisingly close to per-
-    #           token math (70c was the projection). 80c gate.
+    # Calibration history (2026-06-03):
+    #   flash   real 4-16c/round across 5+ sims. 20c gate, ~25% headroom.
+    #   smart   claude-haiku-4.5 — replaced gemini-2.5-pro (which was
+    #           slow: 15+ min/round, thinking-first model). Haiku is
+    #           fast + Anthropic persona-holding. Real cost TBD — initial
+    #           40c gate is per-token math, calibrate with a real round.
     #   sonnet  real 41c on a partial 23-comment round; extrapolated full
-    #           round ~65c. SHORTER replies than Flash (Sonnet honours the
-    #           "1-2 paragraphs" rule more strictly = fewer output tokens),
-    #           so it's NOT 8-9x Flash as per-token math predicted. Sonnet
-    #           ends up costing ~same as Pro in practice. 80c gate.
+    #           ~65c. Anthropic models honour the "1-2 paragraphs" rule
+    #           more strictly than Gemini = fewer output tokens, so cost
+    #           is well below the per-token-math projection. 80c gate.
     "flash":  ("google/gemini-2.5-flash",      20),
-    "pro":    ("google/gemini-2.5-pro",        80),
+    "smart":  ("anthropic/claude-haiku-4.5",   40),
     "sonnet": ("anthropic/claude-sonnet-4.5",  80),
 }
 
