@@ -31,14 +31,17 @@ _DEFAULTS: dict[str, tuple[str, int]] = {
     #   flash   real 4-16c/round across 5+ sims. 20c gate, ~25% headroom.
     #   smart   claude-haiku-4.5 — replaced gemini-2.5-pro (which was
     #           slow: 15+ min/round, thinking-first model). Haiku is
-    #           fast + Anthropic persona-holding. Real cost TBD — initial
-    #           40c gate is per-token math, calibrate with a real round.
+    #           fast + Anthropic persona-holding. Calibrated: real cost
+    #           16c on a 19-comment / 155s round. Anthropic's strict
+    #           rule-following means short replies (= cheap output tokens).
+    #           Smart and Flash cost ~the same in practice (~15c); the
+    #           differentiator is voice quality, not spend. 25c gate.
     #   sonnet  real 41c on a partial 23-comment round; extrapolated full
     #           ~65c. Anthropic models honour the "1-2 paragraphs" rule
     #           more strictly than Gemini = fewer output tokens, so cost
     #           is well below the per-token-math projection. 80c gate.
     "flash":  ("google/gemini-2.5-flash",      20),
-    "smart":  ("anthropic/claude-haiku-4.5",   40),
+    "smart":  ("anthropic/claude-haiku-4.5",   25),
     "sonnet": ("anthropic/claude-sonnet-4.5",  80),
 }
 
