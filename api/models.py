@@ -22,12 +22,25 @@ class Tier:
 
 
 _DEFAULTS: dict[str, tuple[str, int]] = {
-    # Round-cost estimates are calibrated to the observed cost of a 36-agent
-    # round including the late-round context-growth premium. Round up to keep
-    # the balance non-negative even on bad days. Tune per actual data:
-    "flash":  ("google/gemini-2.5-flash",       20),   # observed 4-16¢/round
-    "pro":    ("google/gemini-2.5-pro",         70),   # ~4x flash
-    "sonnet": ("anthropic/claude-sonnet-4.5",  170),   # ~8-9x flash
+    # Round-cost estimates calibrated against real 36-agent rounds (same
+    # topic, persona_mix=0.5). The gate must always be >= worst-case real
+    # cost so balances never go negative. Round up; refund is automatic
+    # since cost is reconciled from real usage.cost after the round.
+    #
+    # Calibration runs (2026-06-03):
+    #   flash   real 4-16c/round across 5+ sims (small topics — large topics
+    #           push higher; the variance with persona_mix and round number
+    #           is real). 20c gate gives 25% headroom.
+    #   pro     real 67c on a 32-comment round. Surprisingly close to per-
+    #           token math (70c was the projection). 80c gate.
+    #   sonnet  real 41c on a partial 23-comment round; extrapolated full
+    #           round ~65c. SHORTER replies than Flash (Sonnet honours the
+    #           "1-2 paragraphs" rule more strictly = fewer output tokens),
+    #           so it's NOT 8-9x Flash as per-token math predicted. Sonnet
+    #           ends up costing ~same as Pro in practice. 80c gate.
+    "flash":  ("google/gemini-2.5-flash",      20),
+    "pro":    ("google/gemini-2.5-pro",        80),
+    "sonnet": ("anthropic/claude-sonnet-4.5",  80),
 }
 
 
