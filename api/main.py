@@ -524,17 +524,23 @@ async def finish_endpoint(conversation_id: str, request: Request) -> dict:
 
 @app.delete("/conversations/{conversation_id}")
 async def kill_endpoint(conversation_id: str, request: Request) -> dict:
+    """Send a cooperative cancel to a running sim. The runner unwinds in
+    ~30s (the in-flight LLM call) and transitions the row to failed itself.
+
+    Returns immediately. The status returned is 'cancelling' (not 'cancelled')
+    because the row may still be 'running' for the next few seconds until
+    the runner sees the signal and reconciles. UI should poll for the final
+    state — see /conversations/{id}.
+    """
     api_key = require_api_key(request)
     row = get_conversation(conversation_id)
     if not row:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     if runner.cancel(conversation_id):
-        update_conversation(conversation_id, status="failed", error="Cancelled", finished_at=_now())
-        append_progress(conversation_id, "Cancelled by user", _now(), "error")
-        # No refund: cost is reconciled per-round from real usage, never charged
-        # upfront. A cancelled in-flight round bills its partial spend in the runner.
-        return {"conversation_id": conversation_id, "status": "cancelled"}
+        # Runner owns the DB transition + the 'Cancelled by user' progress
+        # entry + the partial-spend reconcile. We just signaled it.
+        return {"conversation_id": conversation_id, "status": "cancelling"}
 
     return {"conversation_id": conversation_id, "status": row["status"], "detail": "Not running"}
 

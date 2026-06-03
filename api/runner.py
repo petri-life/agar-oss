@@ -33,6 +33,17 @@ log = logging.getLogger("agar.runner")
 
 _running: dict[str, threading.Thread] = {}
 
+# Per-sim cooperative-cancel signal. Set by cancel(); the OpenRouter backend's
+# call paths check it before each LLM request and raise asyncio.CancelledError
+# if set. asyncio.gather then aborts the round, the runner's exception handler
+# bills the partial spend, and the sim transitions to failed cleanly.
+#
+# Why an Event instead of just polling the DB row's status?
+#   - threading.Event is cheap to read, no DB hit per LLM call.
+#   - Cancel originates in an HTTP handler thread; Event is the safe primitive
+#     for cross-thread signal without locks on every check.
+_cancellation_events: dict[str, threading.Event] = {}
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -71,6 +82,11 @@ def _run_round_sync(
 
     loop = asyncio.new_event_loop()
     session = None
+    # Cooperative cancel: one Event per running sim. cancel() sets it; the
+    # OpenRouter backend's per-call check raises CancelledError, gather()
+    # aborts, the round's spend is reconciled in the except path below.
+    cancel_event = threading.Event()
+    _cancellation_events[conversation_id] = cancel_event
     try:
         # Resolve the tier once; the runner uses the same OpenRouter model id
         # for both round-1 (is_first) and /next paths.
@@ -94,7 +110,9 @@ def _run_round_sync(
 
             if OPENROUTER_API_KEY:
                 from sim.openrouter_model import OpenRouterModel
-                session._model_backend = OpenRouterModel(model=tier.model, timeout=DEFAULT_TIMEOUT)
+                backend = OpenRouterModel(model=tier.model, timeout=DEFAULT_TIMEOUT)
+                backend._cancel_event = cancel_event
+                session._model_backend = backend
 
             update_conversation(conversation_id, session_id=session.session_id)
             append_progress(conversation_id, "Round 1 starting", _now(), "running")
@@ -102,7 +120,9 @@ def _run_round_sync(
             session = Session.load(row["session_id"])
             if OPENROUTER_API_KEY:
                 from sim.openrouter_model import OpenRouterModel
-                session._model_backend = OpenRouterModel(model=tier.model, timeout=DEFAULT_TIMEOUT)
+                backend = OpenRouterModel(model=tier.model, timeout=DEFAULT_TIMEOUT)
+                backend._cancel_event = cancel_event
+                session._model_backend = backend
             update_conversation(conversation_id, status="running")
             round_num = row["round_count"] + 1
             append_progress(conversation_id, f"Round {round_num} starting", _now(), "running")
@@ -162,22 +182,29 @@ def _run_round_sync(
         update_conversation(conversation_id, status="paused")
         log.info("Conversation %s: round complete, paused", conversation_id)
 
-    except Exception as e:
-        log.exception("Conversation %s failed", conversation_id)
-        update_conversation(conversation_id, status="failed", error=str(e), finished_at=_now())
-        append_progress(conversation_id, f"Failed: {e}", _now(), "error")
-        # Estimate-then-reconcile: a failed round still bills whatever real cost
-        # it incurred before failing (calls already cost money). Capture the
-        # partial spend rather than refunding it or charging a flat round.
+    except (Exception, asyncio.CancelledError) as e:
+        # CancelledError is a BaseException in Python 3.8+, NOT caught by
+        # bare `except Exception` — we list it explicitly so cooperative
+        # cancel (via _cancellation_events) lands in this reconcile path
+        # instead of leaking past the runner and leaving cost unbilled.
+        is_cancel = isinstance(e, asyncio.CancelledError) or cancel_event.is_set()
+        if is_cancel:
+            log.info("Conversation %s cancelled by user", conversation_id)
+            update_conversation(conversation_id, status="failed", error="Cancelled by user", finished_at=_now())
+            append_progress(conversation_id, "Cancelled by user", _now(), "error")
+        else:
+            log.exception("Conversation %s failed", conversation_id)
+            update_conversation(conversation_id, status="failed", error=str(e), finished_at=_now())
+            append_progress(conversation_id, f"Failed: {e}", _now(), "error")
+        # Estimate-then-reconcile: a failed/cancelled round still bills whatever
+        # real cost it incurred before bailing (calls already cost money).
+        # Capture the partial spend rather than refunding or charging a flat
+        # round. Sentinel round_num=0 keeps these out of the real-round table.
         backend = getattr(session, "_model_backend", None)
         if backend is not None and hasattr(backend, "reset_cost"):
             spent_cents = _usd_to_cents(backend.reset_cost())
             if spent_cents:
                 decrement_cents(api_key, spent_cents)
-                # Use a sentinel round_num=0 for partial-failure charges so
-                # they never collide with real round costs (rounds are 1-based)
-                # and INSERT OR REPLACE accumulates partial failures into a
-                # single row instead of clobbering a real round's cost.
                 from api.db import get_round_costs
                 prior = next(
                     (r["cost_cents"] for r in get_round_costs(conversation_id)
@@ -185,8 +212,8 @@ def _run_round_sync(
                     0,
                 )
                 record_round_cost(conversation_id, 0, prior + spent_cents, _now())
-                log.info("Conversation %s: billed %d¢ for partial failed round",
-                         conversation_id, spent_cents)
+                log.info("Conversation %s: billed %d¢ for partial round (cancel=%s)",
+                         conversation_id, spent_cents, is_cancel)
     finally:
         if session:
             try:
@@ -195,6 +222,7 @@ def _run_round_sync(
                 pass
         loop.close()
         _running.pop(conversation_id, None)
+        _cancellation_events.pop(conversation_id, None)
 
 
 def start(conversation_id: str, api_key: str, topic: str, profiles: list[dict]) -> None:
@@ -243,13 +271,31 @@ def finish(conversation_id: str) -> bool:
 
 
 def cancel(conversation_id: str) -> bool:
-    """Cancel a running conversation."""
+    """Cancel a running conversation cooperatively.
+
+    Sets a threading.Event the OpenRouter backend checks before each LLM
+    request. The current in-flight HTTP request (if any) finishes — we
+    eat that one call's spend — but the next 30 agents in the round's
+    asyncio.gather get CancelledError and the round bails. The runner's
+    exception handler then reconciles the partial spend and marks the
+    sim failed.
+
+    Returns True if a cancel signal was sent. The thread is NOT joined
+    here; it'll complete its in-flight call (typically <30s) and clean
+    up via its own finally. DB row status is updated by the runner once
+    the round actually unwinds — NOT here. Callers needing immediate UI
+    state should poll /conversations/{id} after this returns.
+    """
     t = _running.get(conversation_id)
     if t and t.is_alive():
-        # Can't cleanly kill a thread — mark as failed, it'll finish eventually
-        update_conversation(conversation_id, status="failed", error="Cancelled", finished_at=_now())
-        append_progress(conversation_id, "Cancelled", _now(), "error")
-        _running.pop(conversation_id, None)
+        ev = _cancellation_events.get(conversation_id)
+        if ev is not None:
+            ev.set()
+        # NOTE: we used to mark the row failed RIGHT HERE, before the runner
+        # had actually wound down. That created the bug where the round
+        # continued spending money on a sim already marked failed — and
+        # later wrote "Round 1: done" on top of "Cancelled by user". Now
+        # the runner owns the state transition.
         return True
     return False
 

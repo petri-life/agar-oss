@@ -77,6 +77,11 @@ class OpenRouterModel(BaseModelBackend):
         # reads + resets this per round, the same lifecycle as cost. Lock
         # shared with cost — same concurrency profile.
         self._sanitized_count = 0
+        # Cooperative cancel signal. The runner sets this to a threading.Event
+        # at sim creation; each call path checks it before talking to OpenRouter
+        # and raises asyncio.CancelledError if set. None = cancellation disabled
+        # (the OSS / local path that has no /conversations endpoint).
+        self._cancel_event: "threading.Event | None" = None
         super().__init__(
             model_type="openrouter",
             model_config_dict={},
@@ -180,7 +185,20 @@ class OpenRouterModel(BaseModelBackend):
             "user": uuid.uuid4().hex,  # unique per request — breaks prompt caching
         }
 
+    def _check_cancel(self) -> None:
+        """Raise asyncio.CancelledError if the runner signaled cancel.
+
+        Called before each LLM request so a cancel during a round aborts the
+        remaining work instead of letting it complete and bill cost. The
+        in-flight HTTP request (if any) still finishes — we eat that one
+        call's cost — but the next 30 agents in the gather don't fire.
+        """
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            import asyncio
+            raise asyncio.CancelledError("sim cancelled by user")
+
     def _call_api(self, messages: list[dict]) -> str:
+        self._check_cancel()
         with httpx.Client(timeout=self._timeout) as client:
             resp = client.post(
                 f"{OPENROUTER_BASE}/chat/completions",
@@ -196,6 +214,7 @@ class OpenRouterModel(BaseModelBackend):
             return self._sanitize(data["choices"][0]["message"]["content"])
 
     async def _acall_api(self, messages: list[dict]) -> str:
+        self._check_cancel()
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(
                 f"{OPENROUTER_BASE}/chat/completions",
