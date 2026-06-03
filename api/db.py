@@ -57,12 +57,35 @@ def init_db() -> None:
             "comment_count INTEGER NOT NULL DEFAULT 0",
             "sim_upvotes INTEGER NOT NULL DEFAULT 0",
             "last_round_cost_cents INTEGER NOT NULL DEFAULT 0",
+            # total_cost_cents is denormalised — equal to SUM(round_costs.cost_cents)
+            # for this conversation. Maintained by record_round_cost(). Avoids a
+            # subquery on every /me/conversations row.
+            "total_cost_cents INTEGER NOT NULL DEFAULT 0",
+            # Tier name ("flash"|"pro"|"sonnet") locked at sim creation. The
+            # runner reads this to pick the OpenRouter model; /next never
+            # re-asks. Default 'flash' for historical rows that pre-date the
+            # picker (they all ran on Flash).
+            "model_id TEXT NOT NULL DEFAULT 'flash'",
         ):
             try:
                 conn.execute(f"ALTER TABLE conversations ADD COLUMN {col}")
             except sqlite3.OperationalError:
                 pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conv_api_key ON conversations(api_key)")
+        # Per-round cost history. One row per round per conversation. Replaces
+        # the single overwritten last_round_cost_cents for "show me what each
+        # round of this sim cost". last_round_cost_cents stays as a fast-read
+        # convenience for SimControls while a round is mid-flight.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS round_costs (
+                conversation_id TEXT NOT NULL,
+                round_num       INTEGER NOT NULL,
+                cost_cents      INTEGER NOT NULL,
+                recorded_at     TEXT NOT NULL,
+                PRIMARY KEY (conversation_id, round_num)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_round_costs_conv ON round_costs(conversation_id)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS progress_log (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -195,6 +218,7 @@ def create_conversation_if_quota(
     persona_mix: float,
     created_at: str,
     min_cents: int = 0,
+    model_id: str = "flash",
 ) -> bool:
     """Gate on balance, then insert the conversation atomically.
 
@@ -202,6 +226,9 @@ def create_conversation_if_quota(
     round estimate). The actual cost is deducted by the runner after the round
     runs, from real per-call usage.cost. `min_cents=0` means unmetered (e.g. the
     Claude-CLI backend, which returns no cost data) — gate always passes.
+
+    `model_id` is the tier name ("flash"|"pro"|"sonnet"), locked at creation.
+    The runner reads it to pick the OpenRouter model for every round.
     """
     with _conn() as conn:
         conn.execute("BEGIN EXCLUSIVE")
@@ -214,9 +241,9 @@ def create_conversation_if_quota(
             return False
         conn.execute(
             """INSERT INTO conversations
-               (conversation_id, session_id, api_key, topic, status, agent_count, persona_mix, created_at)
-               VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)""",
-            (conversation_id, session_id, api_key, topic, agent_count, persona_mix, created_at),
+               (conversation_id, session_id, api_key, topic, status, agent_count, persona_mix, created_at, model_id)
+               VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)""",
+            (conversation_id, session_id, api_key, topic, agent_count, persona_mix, created_at, model_id),
         )
         return True
 
@@ -239,12 +266,15 @@ def get_conversation(conversation_id: str) -> sqlite3.Row | None:
 
 
 def list_conversations() -> list[sqlite3.Row]:
-    """All conversations, newest first, with upvote score."""
+    """All conversations, newest first, with upvote score. PUBLIC view —
+    never include cost columns (cost is owner-private; use
+    list_user_conversations for the owner's view). model_id is included
+    so the public /browse page can show what model produced each sim."""
     with _conn() as conn:
         return conn.execute("""
             SELECT c.conversation_id, c.session_id, c.topic, c.status, c.agent_count,
                    c.round_count, c.persona_mix, c.created_at, c.finished_at,
-                   c.comment_count, c.sim_upvotes,
+                   c.comment_count, c.sim_upvotes, c.model_id,
                    COALESCE(u.score, 0) as score
             FROM conversations c
             LEFT JOIN (
@@ -253,6 +283,67 @@ def list_conversations() -> list[sqlite3.Row]:
             ) u ON c.conversation_id = u.conversation_id
             ORDER BY c.created_at DESC
         """).fetchall()
+
+
+def list_user_conversations(api_key: str) -> list[sqlite3.Row]:
+    """All conversations owned by api_key, newest first. PRIVATE view — adds
+    total_cost_cents + last_round_cost_cents which the public list omits.
+    model_id is included so the FE can badge each sim with its tier."""
+    with _conn() as conn:
+        return conn.execute("""
+            SELECT c.conversation_id, c.topic, c.status, c.agent_count,
+                   c.round_count, c.persona_mix, c.created_at, c.finished_at,
+                   c.comment_count, c.sim_upvotes,
+                   c.total_cost_cents, c.last_round_cost_cents,
+                   c.model_id,
+                   COALESCE(u.score, 0) as score
+            FROM conversations c
+            LEFT JOIN (
+                SELECT conversation_id, COUNT(*) as score
+                FROM comment_upvotes GROUP BY conversation_id
+            ) u ON c.conversation_id = u.conversation_id
+            WHERE c.api_key = ?
+            ORDER BY c.created_at DESC
+        """, (api_key,)).fetchall()
+
+
+# ── Round cost history ──────────────────────────────────────
+
+def record_round_cost(conversation_id: str, round_num: int, cost_cents: int, recorded_at: str) -> None:
+    """Record one round's reconciled cost AND bump the conversation's
+    total_cost_cents. Called by the runner after each round settles. Idempotent
+    by (conversation_id, round_num) — re-inserts replace, total stays correct
+    via the explicit delta path.
+
+    On replace: subtract the old row's cost from total before inserting new.
+    On first insert: total += cost_cents.
+    """
+    with _conn() as conn:
+        prev = conn.execute(
+            "SELECT cost_cents FROM round_costs WHERE conversation_id = ? AND round_num = ?",
+            (conversation_id, round_num),
+        ).fetchone()
+        delta = cost_cents - (prev["cost_cents"] if prev else 0)
+        conn.execute(
+            "INSERT OR REPLACE INTO round_costs "
+            "(conversation_id, round_num, cost_cents, recorded_at) VALUES (?, ?, ?, ?)",
+            (conversation_id, round_num, cost_cents, recorded_at),
+        )
+        conn.execute(
+            "UPDATE conversations SET total_cost_cents = total_cost_cents + ? "
+            "WHERE conversation_id = ?",
+            (delta, conversation_id),
+        )
+
+
+def get_round_costs(conversation_id: str) -> list[sqlite3.Row]:
+    """All recorded round costs for a conversation, oldest round first."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT round_num, cost_cents, recorded_at FROM round_costs "
+            "WHERE conversation_id = ? ORDER BY round_num ASC",
+            (conversation_id,),
+        ).fetchall()
 
 
 # ── Progress ─────────────────────────────────────────────────

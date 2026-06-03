@@ -14,7 +14,7 @@ import threading
 from datetime import datetime, timezone
 
 from api.db import (
-    update_conversation, append_progress, decrement_cents,
+    update_conversation, append_progress, decrement_cents, record_round_cost,
 )
 
 DEFAULT_MODEL = os.environ.get("AGAR_MODEL", "haiku")
@@ -59,16 +59,29 @@ def _run_round_sync(
     profiles: list[dict],
     is_first: bool,
 ) -> None:
-    """Run a single round. Creates the session on first call."""
+    """Run a single round. Creates the session on first call.
+
+    The OpenRouter model used is sourced from the conversation row's model_id
+    (set by POST /conversations and locked for the sim). All rounds of a sim
+    use the same model so cost is predictable from /me/conversations.
+    """
     from sim.session import Session
+    from api.db import get_conversation
+    from api.models import get_tier
 
     loop = asyncio.new_event_loop()
     session = None
     try:
+        # Resolve the tier once; the runner uses the same OpenRouter model id
+        # for both round-1 (is_first) and /next paths.
+        row = get_conversation(conversation_id)
+        tier = get_tier(row["model_id"] if row else None)
+
         if is_first:
             update_conversation(conversation_id, status="running", started_at=_now())
             append_progress(conversation_id, f"Assembled {len(profiles)} agents", _now(), "init")
-            log.info("Conversation %s: creating session with %d agents", conversation_id, len(profiles))
+            log.info("Conversation %s: creating session with %d agents on tier=%s (%s)",
+                     conversation_id, len(profiles), tier.name, tier.model)
 
             session = Session.create_from_profiles(
                 profiles=profiles,
@@ -81,17 +94,15 @@ def _run_round_sync(
 
             if OPENROUTER_API_KEY:
                 from sim.openrouter_model import OpenRouterModel
-                session._model_backend = OpenRouterModel(timeout=DEFAULT_TIMEOUT)
+                session._model_backend = OpenRouterModel(model=tier.model, timeout=DEFAULT_TIMEOUT)
 
             update_conversation(conversation_id, session_id=session.session_id)
             append_progress(conversation_id, "Round 1 starting", _now(), "running")
         else:
-            from api.db import get_conversation
-            row = get_conversation(conversation_id)
             session = Session.load(row["session_id"])
             if OPENROUTER_API_KEY:
                 from sim.openrouter_model import OpenRouterModel
-                session._model_backend = OpenRouterModel(timeout=DEFAULT_TIMEOUT)
+                session._model_backend = OpenRouterModel(model=tier.model, timeout=DEFAULT_TIMEOUT)
             update_conversation(conversation_id, status="running")
             round_num = row["round_count"] + 1
             append_progress(conversation_id, f"Round {round_num} starting", _now(), "running")
@@ -119,6 +130,12 @@ def _run_round_sync(
             spent_usd = backend.reset_cost()
             spent_cents = _usd_to_cents(spent_usd)
             new_balance = decrement_cents(api_key, spent_cents)
+            # round_count is the just-completed round (on_round set it above).
+            # Read it back so we record the cost against the right round_num
+            # even when the runner picks up an existing session for /next.
+            from api.db import get_conversation
+            current_round = get_conversation(conversation_id)["round_count"]
+            record_round_cost(conversation_id, current_round, spent_cents, _now())
             update_conversation(conversation_id, last_round_cost_cents=spent_cents)
             append_progress(
                 conversation_id,
@@ -127,6 +144,19 @@ def _run_round_sync(
             )
             log.info("Conversation %s: billed %d¢ (USD %.4f), balance %d¢",
                      conversation_id, spent_cents, spent_usd, new_balance)
+            # L3 output sanitization: count how many agent replies got
+            # replaced this round. Non-zero means the topic tried to exfiltrate
+            # persona data; the defense caught it.
+            if hasattr(backend, "reset_sanitized_count"):
+                n_sanitized = backend.reset_sanitized_count()
+                if n_sanitized > 0:
+                    append_progress(
+                        conversation_id,
+                        f"Sanitized {n_sanitized} agent comment(s) for leaked persona content",
+                        _now(), "security",
+                    )
+                    log.warning("Conversation %s: sanitized %d comments (persona-leak)",
+                                conversation_id, n_sanitized)
 
         _snapshot_stats(conversation_id, session.session_id)
         update_conversation(conversation_id, status="paused")
@@ -144,6 +174,17 @@ def _run_round_sync(
             spent_cents = _usd_to_cents(backend.reset_cost())
             if spent_cents:
                 decrement_cents(api_key, spent_cents)
+                # Use a sentinel round_num=0 for partial-failure charges so
+                # they never collide with real round costs (rounds are 1-based)
+                # and INSERT OR REPLACE accumulates partial failures into a
+                # single row instead of clobbering a real round's cost.
+                from api.db import get_round_costs
+                prior = next(
+                    (r["cost_cents"] for r in get_round_costs(conversation_id)
+                     if r["round_num"] == 0),
+                    0,
+                )
+                record_round_cost(conversation_id, 0, prior + spent_cents, _now())
                 log.info("Conversation %s: billed %d¢ for partial failed round",
                          conversation_id, spent_cents)
     finally:

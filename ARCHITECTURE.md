@@ -207,3 +207,86 @@ uv run agar revert sim_xxx baseline
 uv run agar status sim_xxx
 uv run agar ls
 ```
+
+## API layer
+
+The CLI drives the sim directly; the API (`agar-api`) wraps it as a service that
+runs **one round per request** — no long-lived background loop. `POST
+/conversations` creates the session and runs round 1 in a daemon thread that
+exits when the round pauses; each `POST /conversations/{id}/next` runs one more.
+
+```
+api/
+├── main.py      FastAPI app, endpoints, auth gates, request validation
+├── runner.py    orch    per-round thread: create/load session → run 1 round → reconcile cost → pause
+├── sampler.py   pure    persona_mix → fixed 36-agent population (18 base + 18 flavor)
+├── db.py        I/O     SQLite: api_keys (balances), conversations, progress, upvotes
+└── thread.py    pure    OASIS DB → API thread JSON; inject human comments
+```
+
+**Two auth boundaries.** Conversation endpoints require `X-API-Key` (an
+auto-provisioned anonymous token). The privileged `POST /tokens` and `POST
+/credits/add` are gated by `require_mint_secret`: when `AGAR_MINT_SECRET` is set
+they need a constant-time-matched `X-Mint-Secret` header; unset (OSS default)
+leaves them open for free local use.
+
+**Model backend swap.** The CLI path uses `claude_model.py` (Claude CLI). When
+`OPENROUTER_API_KEY` is present the runner swaps in `sim/openrouter_model.py`,
+which is the only backend that reports per-call cost.
+
+### Cost metering (estimate-then-reconcile)
+
+Billing exists only on the OpenRouter path; the Claude-CLI backend reports no
+cost and runs unmetered (the free local tier, `METERED = False`).
+
+```
+round start ──► gate: balance ≥ AGAR_ROUND_ESTIMATE_CENTS ?   (worst-case, default 10¢)
+                  │ no → 402 Insufficient balance
+                  ▼ yes
+              backend.reset_cost()            ← zero the accumulator
+              session.run(rounds=1)           ← each LLM call adds real usage.cost (thread-safe)
+              spent = backend.reset_cost()    ← read accumulated USD
+              cents = ceil(spent × 100)        ← round UP, never under-bill
+              decrement_cents(api_key, cents) ← settle; clamp at 0
+              store last_round_cost_cents
+```
+
+A round that *starts* always settles its bill — cost is reconciled after, never
+charged upfront, so there are no refunds. A failed or cancelled in-flight round
+still bills its partial spend (the calls already cost money).
+
+Balances live in `api_keys.credits_remaining` as **cents** (`credits_unit =
+'cents'`). `init_db` migrates any legacy round-count balance by multiplying it by
+`AGAR_LEGACY_ROUND_CENTS`. `POST /credits/add` tops up out of band — called by a
+trusted payment webhook holding the mint secret, not the browser.
+
+### API SQLite schema (separate DB from the per-session OASIS DBs)
+
+```sql
+api_keys (
+    key              TEXT PRIMARY KEY,
+    label            TEXT DEFAULT 'anon',  -- readable, e.g. coral-fox-42
+    created_at       TEXT NOT NULL,
+    revoked          INTEGER DEFAULT 0,
+    credits_remaining INTEGER DEFAULT 3,   -- balance; unit per credits_unit
+    credits_unit     TEXT DEFAULT 'rounds' -- added by migration; flipped to 'cents'
+)                                          -- (× AGAR_LEGACY_ROUND_CENTS) exactly once
+
+conversations (
+    conversation_id       TEXT PRIMARY KEY,
+    session_id            TEXT NOT NULL,    -- 'pending' until the sim DB is created
+    api_key               TEXT NOT NULL,
+    topic                 TEXT NOT NULL,
+    status                TEXT DEFAULT 'queued', -- queued → running → paused → done | failed
+    agent_count           INTEGER NOT NULL,
+    round_count           INTEGER DEFAULT 0,
+    persona_mix           REAL DEFAULT 0.5,
+    created_at            TEXT NOT NULL,
+    started_at            TEXT,
+    finished_at           TEXT,
+    error                 TEXT,
+    comment_count         INTEGER DEFAULT 0, -- snapshotted from the OASIS DB per round
+    sim_upvotes           INTEGER DEFAULT 0,
+    last_round_cost_cents INTEGER DEFAULT 0
+)                                            -- list view derives `score` = COUNT(upvotes)
+```

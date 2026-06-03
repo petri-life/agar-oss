@@ -72,6 +72,11 @@ class OpenRouterModel(BaseModelBackend):
         # Agents call concurrently within a round, so guard with a lock.
         self._cost_lock = threading.Lock()
         self._cost_accumulated = 0.0
+        # Counter of LLM responses we replaced because they contained leaked
+        # persona-template fingerprints (L3 output sanitization). The runner
+        # reads + resets this per round, the same lifecycle as cost. Lock
+        # shared with cost — same concurrency profile.
+        self._sanitized_count = 0
         super().__init__(
             model_type="openrouter",
             model_config_dict={},
@@ -91,6 +96,29 @@ class OpenRouterModel(BaseModelBackend):
             spent = self._cost_accumulated
             self._cost_accumulated = 0.0
             return spent
+
+    def reset_sanitized_count(self) -> int:
+        """Return the count of sanitized responses since the last reset and
+        zero the counter atomically. Lifecycle parallel to reset_cost."""
+        with self._cost_lock:
+            n = self._sanitized_count
+            self._sanitized_count = 0
+            return n
+
+    def _sanitize(self, content: str) -> str:
+        """Apply L3 output filter. Replaces leaked content with an in-character
+        refusal and increments the sanitized counter."""
+        # Lazy import to avoid coupling sim/ to api/ in the OSS package shape
+        # — local dev without an api module still imports OpenRouterModel.
+        try:
+            from api.security import sanitize_llm_output
+        except ImportError:
+            return content
+        sanitized, was = sanitize_llm_output(content)
+        if was:
+            with self._cost_lock:
+                self._sanitized_count += 1
+        return sanitized
 
     def _record_cost(self, data: dict) -> None:
         """Add this response's usage.cost (USD) to the accumulator.
@@ -165,7 +193,7 @@ class OpenRouterModel(BaseModelBackend):
             resp.raise_for_status()
             data = resp.json()
             self._record_cost(data)
-            return data["choices"][0]["message"]["content"]
+            return self._sanitize(data["choices"][0]["message"]["content"])
 
     async def _acall_api(self, messages: list[dict]) -> str:
         async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -180,7 +208,7 @@ class OpenRouterModel(BaseModelBackend):
             resp.raise_for_status()
             data = resp.json()
             self._record_cost(data)
-            return data["choices"][0]["message"]["content"]
+            return self._sanitize(data["choices"][0]["message"]["content"])
 
     def _make_response(
         self,

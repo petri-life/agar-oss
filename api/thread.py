@@ -11,8 +11,17 @@ from sim.html_report import _load_thread_data
 from sim.session import Session
 from api.db import get_comment_upvotes
 
+# AGAR_SHOW_PERSONAS=1 includes the raw system-prompt bio + persona slug in
+# the public thread response. Useful for OSS users debugging personas
+# locally. NEVER set this in production — it leaks every persona's full
+# instruction text to anyone who hits /thread, including via the user
+# popover on the FE. Production should use display_name from each persona's
+# JSONL row (curated, stable across sims).
 SHOW_PERSONAS = os.environ.get("AGAR_SHOW_PERSONAS", "0") == "1"
 
+# Fallback name pool when a persona row has neither display_name nor uid/
+# persona_id. Kept only as a last-resort: with curated display_names this
+# code path should never run in production.
 _ANIMALS = ["fox", "owl", "bear", "wolf", "hawk", "lynx", "crow", "hare", "moth", "newt",
             "crab", "frog", "mole", "wren", "dove", "elk", "eel", "ant", "bee", "ram"]
 _COLORS = ["coral", "amber", "slate", "jade", "rust", "plum", "sage", "teal", "onyx", "dusk",
@@ -95,7 +104,20 @@ def add_comment(session_id: str, content: str, parent_comment_id: int | None = N
 
 
 def _enrich_users(thread_data: dict, session: Session) -> None:
-    """Add persona names to users from profiles_full.jsonl."""
+    """Set the public-facing user fields (name, bio) on each thread user.
+
+    Sources for the display name, in priority order:
+      1. profile.display_name — the curated, stable, cross-sim name set in
+         the hosted personas JSONL. This is the production path.
+      2. profile.uid or profile.persona_id — the raw persona slug. Used by
+         OSS users who haven't added display_name to their personas. Leaks
+         the persona taxonomy (e.g. "spicy-troll_1"); fine for local dev.
+      3. A deterministic color+animal fallback. Last resort if the row has
+         no identifying field at all.
+
+    `bio` is empty in production. SHOW_PERSONAS=1 includes the full system
+    prompt — only ever set this for local debugging.
+    """
     full_path = session.session_dir / "profiles_full.jsonl"
     if not full_path.exists():
         return
@@ -110,17 +132,31 @@ def _enrich_users(thread_data: dict, session: Session) -> None:
         if i not in thread_data["users"]:
             continue
         user = thread_data["users"][i]
+        display_name = p.get("display_name")
         slug = p.get("uid") or p.get("persona_id", f"user_{i}")
+
+        if display_name:
+            user["name"] = display_name
+        elif SHOW_PERSONAS:
+            # Debug mode: show the raw taxonomy slug so OSS users can map
+            # comments back to persona rows.
+            user["name"] = slug
+        else:
+            # No curated name and not in debug — fall back to a deterministic
+            # color+animal. Position-stable per slug, so the same persona in
+            # different sims still gets the same fallback name.
+            h = hashlib.md5(slug.encode()).digest()
+            user["name"] = f"{_COLORS[h[0] % len(_COLORS)]}-{_ANIMALS[h[1] % len(_ANIMALS)]}"
 
         if SHOW_PERSONAS:
             from sim.agent_factory import _build_persona
-            user["name"] = slug
             user["role"] = p.get("role") or p.get("tone") or p.get("dominant", "")
             user["context"] = p.get("context", "full")
             user["bio"] = _build_persona(p)
         else:
-            h = hashlib.md5(slug.encode()).digest()
-            user["name"] = f"{_COLORS[h[0] % len(_COLORS)]}-{_ANIMALS[h[1] % len(_ANIMALS)]}"
+            # Bio is empty in production. The frontend's user-popover used to
+            # render this raw; now it just shows the name. Don't even ship
+            # role/context fields — they're another taxonomy leak.
             user["bio"] = ""
 
 
