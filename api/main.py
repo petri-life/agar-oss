@@ -88,9 +88,15 @@ async def lifespan(app: FastAPI):
     init_db()
     from api.db import _conn
     with _conn() as conn:
+        # Orphan sweep: at process start no runner threads exist, so any
+        # queued/running row is a sim killed mid-round (restart/deploy/crash).
+        # No refund needed — billing is estimate-then-reconcile with no upfront
+        # hold, and the dead round's spend was never reconciled.
+        # 'paused' rows are NOT swept: Session.load() rebuilds them from the
+        # sessions dir (persistent volume on hosted), so they resume fine.
         conn.execute(
             "UPDATE conversations SET status = 'failed', error = 'Server restarted' "
-            "WHERE status IN ('queued', 'running', 'paused')"
+            "WHERE status IN ('queued', 'running')"
         )
     log.info("Agar API started")
     yield
@@ -550,7 +556,12 @@ async def health() -> dict:
     from pathlib import Path
     version_file = Path(__file__).parent.parent / "VERSION"
     version = version_file.read_text().strip() if version_file.exists() else "dev"
-    return {"ok": True, "version": version, "active_sims": runner.active_count()}
+    return {
+        "ok": True,
+        "version": version,
+        "active_sims": runner.active_count(),
+        "max_concurrent": MAX_CONCURRENT,
+    }
 
 
 # ── server ────────────────────────────────────────────────────
