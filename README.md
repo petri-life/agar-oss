@@ -1,39 +1,119 @@
 # Agar
 
-*A social simulation layer for product research.*
+**Generate Hacker News-style discussions around any question using persona-grounded AI agents.**
 
-Agar simulates how a population of behaviorally grounded users reacts to a product
-and its changes — not as independent opinions, but as a social network where
-influence propagates, concerns cascade, and consensus (or backlash) emerges.
+Most LLM chats give you one answer.
 
-It runs a fixed population of persona-grounded agents on a simulated Hacker
-News–style platform: they post, reply, upvote, and react to a product brief across
-multiple rounds. The output is a threaded discussion, a population verdict, and an
-HTML report.
+Agar gives you a thread.
 
-Built on [CAMEL](https://github.com/camel-ai/camel) / OASIS as the multi-agent
-simulation engine.
+Ask a question, paste a product brief, or seed an idea. Agar spins up a small population of AI personas and lets them post, reply, upvote, disagree, and branch on a simulated Hacker News-style forum.
+
+The goal is not to replace human discussion. Real communities are richer, stranger, funnier, and more surprising.
+
+Agar is a private thinking sandbox: a way to surface objections, alternate frames, weird angles, and useful disagreement before you bring an idea to the real world.
+
+> A Petri dish for ideas. 🧫
+
+Built on [CAMEL](https://github.com/camel-ai/camel) / OASIS as the multi-agent simulation engine.
+
+---
+
+---
+
+## What Agar does
+
+Agar simulates how a population of behaviorally grounded users reacts to a topic, question, product brief, or product change.
+
+Unlike a flat list of “20 opinions,” Agar runs a social simulation:
+
+- agents post
+- agents reply
+- agents upvote
+- agents ignore things
+- concerns cascade
+- consensus or backlash can emerge
+- humans can inject comments or changes
+- sessions can be tagged, forked, reverted, and compared
+
+The output is:
+
+- an HN-style threaded discussion
+- a population verdict
+- a Markdown report
+- a standalone HTML report
+
+---
+
+## Why
+
+A lot of useful thinking happens in threads.
+
+The best internet discussions are not just “takes.” They are collisions between different mental models: a skeptical engineer, a domain expert, a founder, a historian, a security person, a user advocate, a contrarian, or someone with one oddly brilliant point.
+
+Most LLM interfaces are linear and 1:1.
+
+Agar explores a different interface:
+
+> Instead of asking an AI for an answer, ask a small synthetic crowd to argue around the idea.
+
+Use it to:
+
+- explore an idea from many angles
+- pressure-test a product decision
+- generate objections before launch
+- simulate user reactions to a change
+- branch from interesting comments
+- inspect how concerns spread across a discussion
+- create synthetic feedback before real feedback exists
+
+Agar is especially useful for early product research, idea exploration, positioning, feature changes, design critique, and launch pre-mortems.
+
+---
+
+## What this is not
+
+Agar is not a source of truth.
+
+It can hallucinate. It can exaggerate disagreement. It can produce plausible nonsense. It can overfit to the persona prompts or the data used to ground those personas.
+
+Use Agar for exploration, critique, and angle-finding.
+
+Do not use it as proof that real users, customers, experts, or communities will react a certain way.
+
+The useful question is not:
+
+> Are these agents right?
+
+The useful question is:
+
+> Did this discussion surface a perspective I should investigate?
 
 ---
 
 ## How it works
 
 ```
-product brief + persona bundles
+question / product brief / idea
         │
         ▼
   population assembly  ──►  agents grounded from app reviews (behavior) + forum voice (tone)
         │
         ▼
-  round-by-round sim   ──►  agents post / reply / upvote on a simulated HN platform
+  HN-style multi-agent simulation   ──►  agents post / reply / upvote on a simulated HN platform
         │
         ▼
   threaded discussion + population verdict + HTML report
 ```
 
-Each agent is grounded in two things: **app-review style data** (what they care
-about, how they rate things) and **forum-comment style voice** (how they actually
-talk). Personas live in JSONL files — see [Personas](#personas) for the schema.
+Each agent is grounded in two things:
+
+1. **Behavioral signal**  
+   App-review-style data: what they care about, what frustrates them, how they rate things.
+
+2. **Voice signal**  
+   Forum-comment-style samples: how they actually sound in discussion.
+
+Personas live in JSONL files. See [Personas](#personas) for the supported schemas.
 
 ---
 
@@ -215,6 +295,66 @@ Example deployment configs live in [`deploy/examples/`](deploy/examples/):
 - `docker-compose.yml` — Docker
 
 A `Dockerfile` is included at the repo root.
+
+---
+
+## FAQ
+
+### Why not just ask ChatGPT for 20 opinions?
+
+Because lists are flat.
+
+Agar is built around interaction. Agents can respond to each other, reinforce concerns, miss parts of the thread, branch into subtopics, and create a discussion shape instead of a single answer.
+
+The point is not more opinions.
+
+The point is useful friction.
+
+### Is this supposed to replace real users?
+
+No.
+
+Agar is useful before real feedback exists, or when you want to explore a topic privately before exposing it to a real community.
+
+Real users are still the source of truth.
+
+### Are the bundled personas real?
+
+The bundled personas are a small synthetic starter set for demos.
+
+For serious use, bring your own grounded persona files.
+
+### Can I use this for product research?
+
+Yes.
+
+That was the original core use case: simulate how a population might react to a product brief, pricing change, feature removal, launch message, or redesign.
+
+But Agar is broader than product research. It can also be used as a general idea-exploration interface.
+
+### Can humans participate?
+
+Yes.
+
+Through the API, humans can inject comments, reply to existing comments, upvote, and continue the discussion round by round.
+
+Through the CLI, humans can inject changes or new prompts into a session.
+
+### Does Agar support local models?
+
+The default local path uses Claude CLI.
+
+OpenRouter is supported for hosted/API usage.
+
+Other backends can be added by implementing a CAMEL-compatible model backend.
+
+### Is this an AI social network?
+
+No.
+
+Agar is not an autonomous social network where agents post forever.
+
+It is a human-directed simulation and thinking interface. You seed the discussion, inspect the branches, inject comments or changes, and decide what is useful.
 
 ---
 
