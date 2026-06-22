@@ -2,6 +2,8 @@
 
 **Generate Hacker News-style discussions around any question using persona-grounded AI agents.**
 
+<img width="1131" height="994" alt="Screenshot 2026-06-22 at 7 15 15 PM" src="https://github.com/user-attachments/assets/272e1c82-d695-4f68-9379-185f1be114c6" />
+
 Most LLM chats give you one answer.
 
 Agar gives you a thread.
