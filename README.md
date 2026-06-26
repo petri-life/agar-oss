@@ -20,6 +20,9 @@ Built on [CAMEL](https://github.com/camel-ai/camel) / OASIS as the multi-agent s
 
 ---
 
+## Try it
+https://disc.simtree.ai/ 
+
 ---
 
 ## What Agar does
